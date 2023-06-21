@@ -1,0 +1,18 @@
+[package]
+name = "prima"
+version = "0.1.0"
+edition = "2021"
+authors    = ["Denys Mentiei <endden@gmail.com>"]
+license    = "MIT"
+repository = "https://github.com/den-mentiei/prima"
+readme     = "README.md"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic         = "abort"
+lto           = "fat"
+codegen-units = 1
