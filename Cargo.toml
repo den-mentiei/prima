@@ -8,6 +8,7 @@ repository = "https://github.com/den-mentiei/prima"
 readme     = "README.md"
 
 [dependencies]
+ash = "0.37.3"
 
 [profile.dev]
 panic = "abort"
