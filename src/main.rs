@@ -8,26 +8,14 @@ use std::str;
 use ash::{vk, Entry};
 use ash::extensions::khr;
 
+const WIDTH:  u32 = 800;
+const HEIGHT: u32 = 600;
+
+// TODO: Handle window resizing.
+
 fn main() -> Result<(), Box<dyn Error>> {
 	println!("Hello, sailor!");
 	unsafe { work() }
-}
-
-#[allow(non_snake_case)]
-unsafe extern "stdcall" fn window_procedure(
-	hwnd: ffi::HWND,
-	uMsg: ffi::UINT,
-	wParam: ffi::WPARAM,
-	lParam: ffi::LPARAM,
-) -> ffi::LRESULT {
-	use ffi::*;
-
-	match uMsg {
-		WM_CLOSE   => drop(DestroyWindow(hwnd)),
-		WM_DESTROY => PostQuitMessage(0),
-		_ => return DefWindowProcA(hwnd, uMsg, wParam, lParam),
-	};
-	0
 }
 
 unsafe fn work() -> Result<(), Box<dyn Error>> {
@@ -57,10 +45,12 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			class_name.as_ptr(),
 			window_name.as_ptr(),
 			WS_OVERLAPPEDWINDOW,
+			// TODO: Center the window or load/save the last position.
 			CW_USEDEFAULT,
 			CW_USEDEFAULT,
-			CW_USEDEFAULT,
-			CW_USEDEFAULT,
+			// TODO: Deal with scaling/HI-DPI & window title.
+			WIDTH as i32,
+			HEIGHT as i32,
 			ptr::null_mut(),
 			ptr::null_mut(),
 			hinstance,
@@ -81,11 +71,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		api_version: vk::make_api_version(0, 1, 0, 0),
 		..Default::default()
 	};
-	// VK_KHR_WIN32_SURFACE_EXTENSION_NAME
-	// let create_info = vk::InstanceCreateInfo {
-	// 	p_application_info: &app_info,
-	// 	..Default::default()
-	// };
+
 	let extensions = [
 		khr::Surface::name().as_ptr(),
 		khr::Win32Surface::name().as_ptr(),
@@ -107,47 +93,185 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 	let physical_devices = instance.enumerate_physical_devices()?;
 
-	let mut physical_device  = None;
-	let mut gfx_queue_family = None;
-	for device in physical_devices.iter() {
-		let queue_family_props = instance.get_physical_device_queue_family_properties(*device);
-		let Some(queue_family) = queue_family_props.iter().position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS)) else {
-			continue
-		};
+	let (physical_device, queue_family) = physical_devices
+		.iter()
+		.find_map(|pdevice| {
+			instance
+				.get_physical_device_queue_family_properties(*pdevice)
+				.iter()
+				.enumerate()
+				.find_map(|(i, props)| {
+					let has_gfx     = props.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+					let can_present = khr_surface.get_physical_device_surface_support(*pdevice, i as u32, surface).ok()?;
+					if has_gfx && can_present {
+						Some((*pdevice, i as u32))
+					} else {
+						None
+					}
+				})
+		})
+		.expect("Failed to find a suitable physical device.");
 
-		let props = instance.get_physical_device_properties(*device);
+	let props = instance.get_physical_device_properties(physical_device);
+	let name  = str_from_null_terminated_bytes(&props.device_name);
+	println!("Using the following physical device: {:?} ({:?})", name, props.device_type);
 
-		let name = str_from_null_terminated_bytes(&props.device_name);
-		println!("Using the following device for graphics: {:?} ({:?})", name, props.device_type);
+	let queue_priority = [1.0];
 
-		physical_device  = Some(*device);
-		gfx_queue_family = Some(queue_family as u32);
-		break;
-	}
-
-	let Some(physical_device)  = physical_device else {
-		panic!("No suitable physical device found.")
-	};
-	let Some(gfx_queue_family) = gfx_queue_family else {
-		panic!("No graphics queue family found.")
-	};
-
-	let queue_priority    = [1.0];
 	let queue_create_info = vk::DeviceQueueCreateInfo::builder()
-		.queue_family_index(gfx_queue_family)
+		.queue_family_index(queue_family)
 		.queue_priorities(&queue_priority);
 
+	let device_extensions = [
+		khr::Swapchain::name().as_ptr(),
+	];
 	let device_create_info = vk::DeviceCreateInfo::builder()
-		.queue_create_infos(slice::from_ref(&queue_create_info));
+		.queue_create_infos(slice::from_ref(&queue_create_info))
+		.enabled_extension_names(&device_extensions);
 
 	let device = instance.create_device(physical_device, &device_create_info, None)?;
+	let queue  = device.get_device_queue(queue_family, 0);
 
-	let gfx_queue = device.get_device_queue(gfx_queue_family, 0);
+	let surface_formats = khr_surface.get_physical_device_surface_formats(physical_device, surface)?;
+	println!("Swapchain supported swapchain formats: {:#?}", surface_formats);
+	let surface_format = surface_formats
+		.iter()
+		.find(|f| f.format == vk::Format::B8G8R8A8_UNORM && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+		.expect("Swapchain doesn't support the srgb_bgra8.");
+	println!("Swapchain format: {:?}", surface_format);
 
-	// TODO: Should be picked, while looping above.
-	let can_present = khr_surface.get_physical_device_surface_support(physical_device, gfx_queue_family, surface)?;
-	println!("Picked device/queue can present into the window's surface!");
-	debug_assert!(can_present);
+	let present_modes = khr_surface.get_physical_device_surface_present_modes(physical_device, surface)?;
+	println!("Physical device supported swapchain presentation modes: {:#?}", present_modes);
+	// let present_mode = present_modes
+	// 	.iter()
+	// 	.copied()
+	// 	.find(|m| *m == vk::PresentModeKHR::MAILBOX) // more energy but lowest latency
+	// 	.unwrap_or(vk::PresentModeKHR::FIFO); // guaranteed to be available.
+	let present_mode = vk::PresentModeKHR::FIFO;
+	println!("Presentation mode: {:?}", present_mode);
+
+	let surface_caps = khr_surface.get_physical_device_surface_capabilities(physical_device, surface)?;
+	println!("{:#?}", surface_caps);
+
+	let mut client_rect = RECT::default();
+	let err = unsafe { GetClientRect(hwnd, &mut client_rect) };
+	if err != 1 {
+		panic!("Failed to get window client rect.");
+	}
+	let window_client_size = (
+		(client_rect.right - client_rect.left) as u32,
+		(client_rect.bottom - client_rect.top) as u32,
+	);
+	println!("Window client size: {:?}", window_client_size);
+
+	let swapchain_size = (
+		window_client_size.0.clamp(surface_caps.min_image_extent.width,  surface_caps.min_image_extent.width),
+		window_client_size.1.clamp(surface_caps.min_image_extent.height, surface_caps.min_image_extent.height),
+	);
+	println!("Swapchain size: {:?}", swapchain_size);
+	let swapchain_extent = vk::Extent2D::builder()
+		.width(swapchain_size.0)
+		.height(swapchain_size.1);
+
+	let swapchain_image_count = surface_caps.min_image_count;
+	println!("Swapchain image count: {swapchain_image_count}");
+
+	let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
+		.surface(surface)
+		.min_image_count(swapchain_image_count)
+		.image_format(surface_format.format)
+		.image_color_space(surface_format.color_space)
+		.image_extent(*swapchain_extent)
+		.image_array_layers(1)
+		.image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+		.image_sharing_mode(vk::SharingMode::EXCLUSIVE) // we have same queue for graphics & presentation
+		.pre_transform(surface_caps.current_transform)
+		.composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+		.present_mode(present_mode)
+		.clipped(true);
+
+	let khr_swapchain = khr::Swapchain::new(&instance, &device);
+	let swapchain = khr_swapchain.create_swapchain(&swapchain_create_info, None)?;
+
+	let swapchain_images = khr_swapchain.get_swapchain_images(swapchain)?;
+	assert!(swapchain_images.len() == swapchain_image_count as usize);
+
+	let mut swapchain_image_views = Vec::with_capacity(swapchain_images.len());
+	for image in swapchain_images.iter() {
+		let image_view_create_info = vk::ImageViewCreateInfo::builder()
+			.view_type(vk::ImageViewType::TYPE_2D)
+			.format(surface_format.format)
+			.components(vk::ComponentMapping {
+				r: vk::ComponentSwizzle::R,
+				g: vk::ComponentSwizzle::G,
+				b: vk::ComponentSwizzle::B,
+				a: vk::ComponentSwizzle::A,
+			})
+			.subresource_range(vk::ImageSubresourceRange {
+				aspect_mask: vk::ImageAspectFlags::COLOR,
+				base_mip_level: 0,
+				level_count: 0,
+				base_array_layer: 0,
+				layer_count: 1,
+			})
+			.image(*image);
+		let image_view = device.create_image_view(&image_view_create_info, None)?;
+		swapchain_image_views.push(image_view);
+	}
+
+	let mut swapchain_framebuffers = Vec::with_capacity(swapchain_image_views.len());
+	for image_view in swapchain_image_views.iter() {
+		let image_views = [*image_view];
+		let framebuffer_create_info = vk::FramebufferCreateInfo::builder()
+			.attachments(&image_views[..])
+			.width(swapchain_extent.width)
+			.height(swapchain_extent.height)
+			.layers(1);
+		let framebuffer = device.create_framebuffer(&framebuffer_create_info, None)?;
+		swapchain_framebuffers.push(framebuffer);
+	}
+	// @Incomplete Specify render pass.
+	// @Incomplete Destroy framebuffers.
+
+	let semaphore_create_info = vk::SemaphoreCreateInfo::default();
+	let present_complete_sema = device.create_semaphore(&semaphore_create_info, None)?;
+
+	let pool_create_info = vk::CommandPoolCreateInfo::builder()
+		.queue_family_index(queue_family)
+		.flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+	let command_pool = device.create_command_pool(&pool_create_info, None)?;
+
+	let cmd_buffer_alloc_info = vk::CommandBufferAllocateInfo::builder()
+		.command_buffer_count(1)
+		.command_pool(command_pool)
+		.level(vk::CommandBufferLevel::PRIMARY);
+
+	let cmd_buffers = device.allocate_command_buffers(&cmd_buffer_alloc_info)?;
+	assert!(!cmd_buffers.is_empty());
+	let cmd_buffer = cmd_buffers[0];
+
+	let fence_create_info = vk::FenceCreateInfo::builder()
+		.flags(vk::FenceCreateFlags::SIGNALED);
+
+	let draw_reuse_fence = device.create_fence(&fence_create_info, None)?;
+
+	// TODO: Don't be so crude with the timeout.
+	// device.wait_for_fences(&[draw_reuse_fence], true, u64::MAX)?;
+	// device.reset_fences(&[draw_reuse_fence])?;
+
+	// device.reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES)?;
+
+	// let cmd_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
+	// 	.flags(vk::CommandBufferUsageFlags::empty());
+	// device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
+
+	// TODO: Something :-)
+
+	// device.end_command_buffer(cmd_buffer)?;
+
+	// let sumbit_info = vk::SubmitInfo::builder()
+	// 	.wait_semaphores(&[present_complete_sema])
+	// 	.command_buffers(&[cmd_buffer]);
 
 	unsafe { ShowWindow(hwnd, SW_SHOW) };
 
@@ -165,15 +289,52 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 				DispatchMessageA(&msg);
 			},
 		}
+
+		let (i, _is_suboptimal) = khr_swapchain.acquire_next_image(swapchain, u64::MAX, present_complete_sema, vk::Fence::null())?;
+
+		let swapchains    = [swapchain];
+		let image_indices = [i];
+		let present_info  = vk::PresentInfoKHR::builder()
+			.swapchains(&swapchains)
+			.image_indices(&image_indices);
+		khr_swapchain.queue_present(queue, &present_info)?;
+		device.device_wait_idle()?;
 	}
 
+	// TODO: @bug Do a drop/defer guards for this.
 	unsafe {
+		device.device_wait_idle()?;
+
+		device.destroy_fence(draw_reuse_fence, None);
+		device.destroy_command_pool(command_pool, None);
+		device.destroy_semaphore(present_complete_sema, None);
+		for image_view in swapchain_image_views {
+			device.destroy_image_view(image_view, None);
+		}
+		khr_swapchain.destroy_swapchain(swapchain, None);
 		khr_surface.destroy_surface(surface, None);
 		device.destroy_device(None);
 		instance.destroy_instance(None);
 	}
 
 	Ok(())
+}
+
+#[allow(non_snake_case)]
+unsafe extern "stdcall" fn window_procedure(
+	hwnd: ffi::HWND,
+	uMsg: ffi::UINT,
+	wParam: ffi::WPARAM,
+	lParam: ffi::LPARAM,
+) -> ffi::LRESULT {
+	use ffi::*;
+
+	match uMsg {
+		WM_CLOSE   => drop(DestroyWindow(hwnd)),
+		WM_DESTROY => PostQuitMessage(0),
+		_ => return DefWindowProcA(hwnd, uMsg, wParam, lParam),
+	};
+	0
 }
 
 unsafe fn str_from_null_terminated_bytes(bytes: &[i8]) -> &str {
@@ -214,6 +375,7 @@ mod ffi {
 	pub type ULONG_PTR = usize;
 	pub type UINT      = ffi::c_uint;
 	pub type UINT_PTR  = usize;
+	pub type LPRECT    = *mut RECT;
 
 	pub const WS_OVERLAPPED: u32       = 0x00000000;
 	pub const WS_CAPTION: u32          = 0x00C00000;
@@ -279,24 +441,34 @@ mod ffi {
 
 	#[repr(C)]
 	pub struct POINT {
-		x: LONG,
-		y: LONG,
+		pub x: LONG,
+		pub y: LONG,
 	}
 
 	impl_zeroed_default!(POINT);
 
 	#[repr(C)]
 	pub struct MSG {
-		hwnd: HWND,
-		message: UINT,
-		wParam: WPARAM,
-		lParam: LPARAM,
-		time: DWORD,
-		pt: POINT,
-		lPrivate: DWORD,
+		pub hwnd: HWND,
+		pub message: UINT,
+		pub wParam: WPARAM,
+		pub lParam: LPARAM,
+		pub time: DWORD,
+		pub pt: POINT,
+		pub lPrivate: DWORD,
 	}
 
 	impl_zeroed_default!(MSG);
+
+	#[repr(C)]
+	pub struct RECT {
+		pub left: LONG,
+		pub top: LONG,
+		pub right: LONG,
+		pub bottom: LONG,
+	}
+
+	impl_zeroed_default!(RECT);
 
 	#[link(name = "User32")]
 	extern "stdcall" {
@@ -355,6 +527,8 @@ mod ffi {
 		pub fn DestroyWindow(hWnd: HWND) -> BOOL;
 
 		pub fn PostQuitMessage(nExitCode: ffi::c_int);
+
+		pub fn GetClientRect(hwnd: HWND, lpRect: LPRECT) -> BOOL;
 	}
 
 	#[link(name = "Kernel32")]
