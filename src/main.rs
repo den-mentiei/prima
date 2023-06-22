@@ -4,6 +4,7 @@
 use std::error::Error;
 use std::slice;
 use std::str;
+use std::ffi::CStr;
 
 use ash::{vk, Entry};
 use ash::extensions::khr;
@@ -24,7 +25,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 	let hinstance = unsafe { GetModuleHandleA(ptr::null()) };
 
-	let class_name = str_to_null_terminated_ascii("PRIMA_CLASS");
+	let class_name = CStr::from_bytes_with_nul_unchecked(b"PRIMA_CLASS\0");
 
 	let mut wc = WNDCLASSA::default();
 	wc.lpfnWndProc = Some(window_procedure);
@@ -38,7 +39,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		panic!("Failed to register the window class, error code = {last_error}");
 	}
 
-	let window_name = str_to_null_terminated_ascii("Prima!");
+	let window_name = CStr::from_bytes_with_nul_unchecked(b"Prima!\0");
 	let hwnd = unsafe {
 		CreateWindowExA(
 			0,
@@ -76,9 +77,15 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		khr::Surface::name().as_ptr(),
 		khr::Win32Surface::name().as_ptr(),
 	];
+	let layers = [
+		// TODO: Make it a debug/cmd-line flag only.
+		CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0").as_ptr(),
+	];
+
 	let create_info = vk::InstanceCreateInfo::builder()
 		.application_info(&app_info)
-		.enabled_extension_names(&extensions);
+		.enabled_extension_names(&extensions)
+		.enabled_layer_names(&layers);
 
 	let instance = entry.create_instance(&create_info, None)?;
 
@@ -210,7 +217,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			.subresource_range(vk::ImageSubresourceRange {
 				aspect_mask: vk::ImageAspectFlags::COLOR,
 				base_mip_level: 0,
-				level_count: 0,
+				level_count: 1,
 				base_array_layer: 0,
 				layer_count: 1,
 			})
@@ -219,18 +226,18 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		swapchain_image_views.push(image_view);
 	}
 
-	let mut swapchain_framebuffers = Vec::with_capacity(swapchain_image_views.len());
-	for image_view in swapchain_image_views.iter() {
-		let image_views = [*image_view];
-		let framebuffer_create_info = vk::FramebufferCreateInfo::builder()
-			.attachments(&image_views[..])
-			.width(swapchain_extent.width)
-			.height(swapchain_extent.height)
-			.layers(1);
-		let framebuffer = device.create_framebuffer(&framebuffer_create_info, None)?;
-		swapchain_framebuffers.push(framebuffer);
-	}
 	// @Incomplete Specify render pass.
+	// let mut swapchain_framebuffers = Vec::with_capacity(swapchain_image_views.len());
+	// for image_view in swapchain_image_views.iter() {
+	// 	let image_views = [*image_view];
+	// 	let framebuffer_create_info = vk::FramebufferCreateInfo::builder()
+	// 		.attachments(&image_views[..])
+	// 		.width(swapchain_extent.width)
+	// 		.height(swapchain_extent.height)
+	// 		.layers(1);
+	// 	let framebuffer = device.create_framebuffer(&framebuffer_create_info, None)?;
+	// 	swapchain_framebuffers.push(framebuffer);
+	// }
 	// @Incomplete Destroy framebuffers.
 
 	let semaphore_create_info = vk::SemaphoreCreateInfo::default();
@@ -357,11 +364,6 @@ unsafe fn str_from_null_terminated_bytes(bytes: &[i8]) -> &str {
 	let n = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
 	let s = slice::from_raw_parts(bytes.as_ptr() as *const u8, n);
 	str::from_utf8_unchecked(s)
-}
-
-fn str_to_null_terminated_ascii(s: &str) -> Vec<i8> {
-	debug_assert!(s.is_ascii());
-	s.bytes().map(|b| b as i8).chain(Some(0)).collect()
 }
 
 #[allow(non_camel_case_types)]
