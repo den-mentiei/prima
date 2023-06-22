@@ -234,7 +234,8 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	// @Incomplete Destroy framebuffers.
 
 	let semaphore_create_info = vk::SemaphoreCreateInfo::default();
-	let present_complete_sema = device.create_semaphore(&semaphore_create_info, None)?;
+	let acquire_semaphore     = device.create_semaphore(&semaphore_create_info, None)?;
+	let release_semaphore     = device.create_semaphore(&semaphore_create_info, None)?;
 
 	let pool_create_info = vk::CommandPoolCreateInfo::builder()
 		.queue_family_index(queue_family)
@@ -259,20 +260,6 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	// device.wait_for_fences(&[draw_reuse_fence], true, u64::MAX)?;
 	// device.reset_fences(&[draw_reuse_fence])?;
 
-	// device.reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES)?;
-
-	// let cmd_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
-	// 	.flags(vk::CommandBufferUsageFlags::empty());
-	// device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
-
-	// TODO: Something :-)
-
-	// device.end_command_buffer(cmd_buffer)?;
-
-	// let sumbit_info = vk::SubmitInfo::builder()
-	// 	.wait_semaphores(&[present_complete_sema])
-	// 	.command_buffers(&[cmd_buffer]);
-
 	unsafe { ShowWindow(hwnd, SW_SHOW) };
 
 	let mut msg = MSG::default();
@@ -290,13 +277,41 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			},
 		}
 
-		let (i, _is_suboptimal) = khr_swapchain.acquire_next_image(swapchain, u64::MAX, present_complete_sema, vk::Fence::null())?;
+		let (i, _is_suboptimal) = khr_swapchain.acquire_next_image(swapchain, u64::MAX, acquire_semaphore, vk::Fence::null())?;
 
-		let swapchains    = [swapchain];
-		let image_indices = [i];
+		device.reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES)?;
+
+		let cmd_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
+			.flags(vk::CommandBufferUsageFlags::empty());
+		device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
+
+		let mut clear_color = vk::ClearColorValue::default();
+		clear_color.float32 = [1.0, 0.0, 1.0, 1.0];
+
+		let range = vk::ImageSubresourceRange {
+			aspect_mask: vk::ImageAspectFlags::COLOR,
+			base_mip_level: 0,
+			level_count: 1,
+			base_array_layer: 0,
+			layer_count: 1,
+		};
+		let image = swapchain_images[i as usize];
+		device.cmd_clear_color_image(cmd_buffer, image, vk::ImageLayout::GENERAL, &clear_color, slice::from_ref(&range));
+
+		device.end_command_buffer(cmd_buffer)?;
+
+		let submit_stage_mask = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+		let submit_info = vk::SubmitInfo::builder()
+			.wait_semaphores(slice::from_ref(&acquire_semaphore))
+			.signal_semaphores(slice::from_ref(&release_semaphore))
+			.wait_dst_stage_mask(slice::from_ref(&submit_stage_mask))
+			.command_buffers(slice::from_ref(&cmd_buffer));
+		device.queue_submit(queue, slice::from_ref(&*submit_info), vk::Fence::null())?;
+
 		let present_info  = vk::PresentInfoKHR::builder()
-			.swapchains(&swapchains)
-			.image_indices(&image_indices);
+			.wait_semaphores(slice::from_ref(&release_semaphore))
+			.swapchains(slice::from_ref(&swapchain))
+			.image_indices(slice::from_ref(&i));
 		khr_swapchain.queue_present(queue, &present_info)?;
 		device.device_wait_idle()?;
 	}
@@ -307,7 +322,8 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 		device.destroy_fence(draw_reuse_fence, None);
 		device.destroy_command_pool(command_pool, None);
-		device.destroy_semaphore(present_complete_sema, None);
+		device.destroy_semaphore(release_semaphore, None);
+		device.destroy_semaphore(acquire_semaphore, None);
 		for image_view in swapchain_image_views {
 			device.destroy_image_view(image_view, None);
 		}
