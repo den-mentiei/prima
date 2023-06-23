@@ -246,7 +246,8 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		.store_op(vk::AttachmentStoreOp::STORE)
 		.stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
 		.stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-		.initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+		.initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+		.final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
 	let attachment_ref = vk::AttachmentReference::builder()
 		.attachment(0)
@@ -289,15 +290,6 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	let cmd_buffers = device.allocate_command_buffers(&cmd_buffer_alloc_info)?;
 	assert!(!cmd_buffers.is_empty());
 	let cmd_buffer = cmd_buffers[0];
-
-	let fence_create_info = vk::FenceCreateInfo::builder()
-		.flags(vk::FenceCreateFlags::SIGNALED);
-
-	let draw_reuse_fence = device.create_fence(&fence_create_info, None)?;
-
-	// TODO: Don't be so crude with the timeout.
-	// device.wait_for_fences(&[draw_reuse_fence], true, u64::MAX)?;
-	// device.reset_fences(&[draw_reuse_fence])?;
 
 	let vs_shader_spv = read_spv(Path::new("shaders/tri.vert.spv"))?;
 	let shader_create_info = vk::ShaderModuleCreateInfo::builder()
@@ -392,11 +384,29 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 		let (i, _is_suboptimal) = khr_swapchain.acquire_next_image(swapchain, u64::MAX, acquire_semaphore, vk::Fence::null())?;
 
-		device.reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES)?;
+		device.reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
 
 		let cmd_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
-			.flags(vk::CommandBufferUsageFlags::empty());
+			.flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 		device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
+
+		let image = swapchain_images[i as usize];
+		let render_begin_barrier = image_barrier(
+			&image,
+			vk::AccessFlags::empty(),
+			vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+			vk::ImageLayout::UNDEFINED,
+			vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+		);
+		device.cmd_pipeline_barrier(
+			cmd_buffer,
+			vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+			vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+			vk::DependencyFlags::BY_REGION,
+			&[],
+			&[],
+			slice::from_ref(&render_begin_barrier),
+		);
 
 		let mut clear_color = vk::ClearColorValue::default();
 		clear_color.float32 = [0.4, 0.6, 0.45, 1.0];
@@ -412,6 +422,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 				extent: *swapchain_extent,
 			})
 			.clear_values(slice::from_ref(&clear_value));
+
 
 		device.cmd_begin_render_pass(cmd_buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
 
@@ -433,6 +444,23 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
 
 		device.cmd_end_render_pass(cmd_buffer);
+
+		let render_end_barrier = image_barrier(
+			&image,
+			vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+			vk::AccessFlags::empty(),
+			vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+			vk::ImageLayout::PRESENT_SRC_KHR,
+		);
+		device.cmd_pipeline_barrier(
+			cmd_buffer,
+			vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+			vk::PipelineStageFlags::TOP_OF_PIPE,
+			vk::DependencyFlags::BY_REGION,
+			&[],
+			&[],
+			slice::from_ref(&render_end_barrier),
+		);
 
 		device.end_command_buffer(cmd_buffer)?;
 
@@ -458,7 +486,6 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 		device.destroy_shader_module(fs_shader, None);
 		device.destroy_shader_module(vs_shader, None);
-		device.destroy_fence(draw_reuse_fence, None);
 		device.destroy_command_pool(command_pool, None);
 		device.destroy_semaphore(release_semaphore, None);
 		device.destroy_semaphore(acquire_semaphore, None);
@@ -477,6 +504,31 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	}
 
 	Ok(())
+}
+
+unsafe fn image_barrier(
+	image: &vk::Image,
+	src_access_mask: vk::AccessFlags,
+	dst_access_mask: vk::AccessFlags,
+	old_layout: vk::ImageLayout,
+	new_layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier {
+	let range = vk::ImageSubresourceRange::builder()
+		.aspect_mask(vk::ImageAspectFlags::COLOR)
+		.level_count(vk::REMAINING_MIP_LEVELS)
+		.layer_count(vk::REMAINING_ARRAY_LAYERS); // Afair, those are not fully supported on Android.
+
+	let barrier = vk::ImageMemoryBarrier::builder()
+		.src_access_mask(src_access_mask)
+		.dst_access_mask(dst_access_mask)
+		.old_layout(old_layout)
+		.new_layout(new_layout)
+		.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+		.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+		.image(*image)
+		.subresource_range(*range);
+
+	*barrier
 }
 
 unsafe extern "system" fn vulkan_debug_message_callback(
