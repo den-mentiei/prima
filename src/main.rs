@@ -2,9 +2,13 @@
 #![allow(unused_variables)]
 
 use std::error::Error;
+use std::ffi::CStr;
+use std::fs;
+use std::io;
+use std::io::Read;
+use std::path::Path;
 use std::slice;
 use std::str;
-use std::ffi::CStr;
 
 use ash::{vk, Entry};
 use ash::extensions::khr;
@@ -226,19 +230,38 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		swapchain_image_views.push(image_view);
 	}
 
-	// @Incomplete Specify render pass.
-	// let mut swapchain_framebuffers = Vec::with_capacity(swapchain_image_views.len());
-	// for image_view in swapchain_image_views.iter() {
-	// 	let image_views = [*image_view];
-	// 	let framebuffer_create_info = vk::FramebufferCreateInfo::builder()
-	// 		.attachments(&image_views[..])
-	// 		.width(swapchain_extent.width)
-	// 		.height(swapchain_extent.height)
-	// 		.layers(1);
-	// 	let framebuffer = device.create_framebuffer(&framebuffer_create_info, None)?;
-	// 	swapchain_framebuffers.push(framebuffer);
-	// }
-	// @Incomplete Destroy framebuffers.
+	let attachment = vk::AttachmentDescription::builder()
+		.format(surface_format.format)
+		.samples(vk::SampleCountFlags::TYPE_1)
+		.load_op(vk::AttachmentLoadOp::CLEAR)
+		.store_op(vk::AttachmentStoreOp::STORE)
+		.stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+		.stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+		.initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+	let attachment_ref = vk::AttachmentReference::builder()
+		.attachment(0)
+		.layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+	let subpass = vk::SubpassDescription::builder()
+		.pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+		.color_attachments(slice::from_ref(&attachment_ref));
+
+	let render_pass_create_info = vk::RenderPassCreateInfo::builder()
+		.subpasses(slice::from_ref(&subpass))
+		.attachments(slice::from_ref(&attachment));
+	let render_pass = device.create_render_pass(&render_pass_create_info, None)?;
+
+	let mut swapchain_framebuffers = Vec::with_capacity(swapchain_image_views.len());
+	for image_view in swapchain_image_views.iter() {
+		let framebuffer_create_info = vk::FramebufferCreateInfo::builder()
+			.render_pass(render_pass)
+			.attachments(slice::from_ref(image_view))
+			.width(swapchain_extent.width)
+			.height(swapchain_extent.height)
+			.layers(1);
+		let framebuffer = device.create_framebuffer(&framebuffer_create_info, None)?;
+		swapchain_framebuffers.push(framebuffer);
+	}
 
 	let semaphore_create_info = vk::SemaphoreCreateInfo::default();
 	let acquire_semaphore     = device.create_semaphore(&semaphore_create_info, None)?;
@@ -267,6 +290,80 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	// device.wait_for_fences(&[draw_reuse_fence], true, u64::MAX)?;
 	// device.reset_fences(&[draw_reuse_fence])?;
 
+	let vs_shader_spv = read_spv(Path::new("shaders/tri.vert.spv"))?;
+	let shader_create_info = vk::ShaderModuleCreateInfo::builder()
+		.code(&vs_shader_spv);
+	let vs_shader = device.create_shader_module(&shader_create_info, None)?;
+
+	let fs_shader_spv = read_spv(Path::new("shaders/tri.frag.spv"))?;
+	let shader_create_info = vk::ShaderModuleCreateInfo::builder()
+		.code(&fs_shader_spv);
+	let fs_shader = device.create_shader_module(&shader_create_info, None)?;
+
+	let pipeline_cache = vk::PipelineCache::null(); // TODO:
+
+	let shader_main_name = CStr::from_bytes_with_nul_unchecked(b"main\0");
+	let vs_stage_create_info = vk::PipelineShaderStageCreateInfo::builder()
+		.stage(vk::ShaderStageFlags::VERTEX)
+		.module(vs_shader)
+		.name(&shader_main_name);
+	let fs_stage_create_info = vk::PipelineShaderStageCreateInfo::builder()
+		.stage(vk::ShaderStageFlags::FRAGMENT)
+		.module(fs_shader)
+		.name(&shader_main_name);
+
+	let stages = [
+		*vs_stage_create_info,
+		*fs_stage_create_info,
+	];
+
+	let vertex_input_state_create_info = vk::PipelineVertexInputStateCreateInfo::default();
+
+	let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+		.topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+	let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+		.viewport_count(1)
+		.scissor_count(1);
+
+	let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+		.line_width(1.0);
+
+	let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+		.rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+	let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default();
+
+	let color_blend_state_attachment = vk::PipelineColorBlendAttachmentState::builder()
+		.color_write_mask(vk::ColorComponentFlags::RGBA);
+	let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+		.attachments(slice::from_ref(&color_blend_state_attachment));
+
+	let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+	let dynamic_states = vk::PipelineDynamicStateCreateInfo::builder()
+		.dynamic_states(&dynamic_states);
+
+	let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::default();
+	let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_create_info, None)?;
+
+	let gfx_pipeline_create_info = vk::GraphicsPipelineCreateInfo::builder()
+		.stages(&stages)
+		.vertex_input_state(&vertex_input_state_create_info)
+		.input_assembly_state(&input_assembly_state)
+		.viewport_state(&viewport_state)
+		.rasterization_state(&rasterization_state)
+		.multisample_state(&multisample_state)
+		.depth_stencil_state(&depth_stencil_state)
+		.color_blend_state(&color_blend_state)
+		.dynamic_state(&dynamic_states)
+		.layout(pipeline_layout)
+		.render_pass(render_pass);
+
+	let pipelines = device
+		.create_graphics_pipelines(pipeline_cache, slice::from_ref(&gfx_pipeline_create_info), None)
+		.expect("Failed to create a graphics pipeline.");
+	let tri_pipeline = pipelines[0];
+
 	unsafe { ShowWindow(hwnd, SW_SHOW) };
 
 	let mut msg = MSG::default();
@@ -293,17 +390,40 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
 
 		let mut clear_color = vk::ClearColorValue::default();
-		clear_color.float32 = [1.0, 0.0, 1.0, 1.0];
+		clear_color.float32 = [0.4, 0.6, 0.45, 1.0];
 
-		let range = vk::ImageSubresourceRange {
-			aspect_mask: vk::ImageAspectFlags::COLOR,
-			base_mip_level: 0,
-			level_count: 1,
-			base_array_layer: 0,
-			layer_count: 1,
+		let mut clear_value = vk::ClearValue::default();
+		clear_value.color = clear_color;
+
+		let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
+			.render_pass(render_pass)
+			.framebuffer(swapchain_framebuffers[i as usize])
+			.render_area(vk::Rect2D {
+				offset: vk::Offset2D::default(),
+				extent: *swapchain_extent,
+			})
+			.clear_values(slice::from_ref(&clear_value));
+
+		device.cmd_begin_render_pass(cmd_buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
+
+		let viewport = vk::Viewport {
+			x: 0.0,
+			y: 0.0,
+			width:  swapchain_extent.width  as f32,
+			height: swapchain_extent.height as f32,
+			min_depth: 0.0,
+			max_depth: 0.1,
 		};
-		let image = swapchain_images[i as usize];
-		device.cmd_clear_color_image(cmd_buffer, image, vk::ImageLayout::GENERAL, &clear_color, slice::from_ref(&range));
+		let scissor = vk::Rect2D {
+			offset: vk::Offset2D::default(),
+			extent: *swapchain_extent,
+		};
+		device.cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
+		device.cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&scissor));
+		device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, tri_pipeline);
+		device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
+
+		device.cmd_end_render_pass(cmd_buffer);
 
 		device.end_command_buffer(cmd_buffer)?;
 
@@ -327,10 +447,16 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	unsafe {
 		device.device_wait_idle()?;
 
+		device.destroy_shader_module(fs_shader, None);
+		device.destroy_shader_module(vs_shader, None);
 		device.destroy_fence(draw_reuse_fence, None);
 		device.destroy_command_pool(command_pool, None);
 		device.destroy_semaphore(release_semaphore, None);
 		device.destroy_semaphore(acquire_semaphore, None);
+		for framebuffer in swapchain_framebuffers {
+			device.destroy_framebuffer(framebuffer, None);
+		}
+		device.destroy_render_pass(render_pass, None);
 		for image_view in swapchain_image_views {
 			device.destroy_image_view(image_view, None);
 		}
@@ -341,6 +467,20 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	}
 
 	Ok(())
+}
+
+fn read_spv(path: &Path) -> Result<Vec<u32>, io::Error> {
+	let mut f = fs::File::open(path)?;
+	let len = f.metadata()?.len() as usize;
+	assert!(len % 4 == 0);
+	let words = len / 4;
+
+	let mut spv = vec![0; words];
+	f.read_exact(unsafe { slice::from_raw_parts_mut(spv.as_mut_ptr().cast::<u8>(), len) })?;
+
+	assert!(spv[0] == 0x0723_0203);
+
+	Ok(spv)
 }
 
 #[allow(non_snake_case)]
