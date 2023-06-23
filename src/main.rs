@@ -2,7 +2,7 @@
 #![allow(unused_variables)]
 
 use std::error::Error;
-use std::ffi::CStr;
+use std::ffi::{c_void, CStr};
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -11,7 +11,7 @@ use std::slice;
 use std::str;
 
 use ash::{vk, Entry};
-use ash::extensions::khr;
+use ash::extensions::{ext, khr};
 
 const WIDTH:  u32 = 800;
 const HEIGHT: u32 = 600;
@@ -77,9 +77,10 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		..Default::default()
 	};
 
-	let extensions = [
+	let instance_extensions = [
 		khr::Surface::name().as_ptr(),
 		khr::Win32Surface::name().as_ptr(),
+		ext::DebugUtils::name().as_ptr(),
 	];
 	let layers = [
 		// TODO: Make it a debug/cmd-line flag only.
@@ -88,10 +89,18 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 	let create_info = vk::InstanceCreateInfo::builder()
 		.application_info(&app_info)
-		.enabled_extension_names(&extensions)
+		.enabled_extension_names(&instance_extensions)
 		.enabled_layer_names(&layers);
 
 	let instance = entry.create_instance(&create_info, None)?;
+
+	let debug_utils = ext::DebugUtils::new(&entry, &instance);
+
+	let dbg_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default();
+	// TODO: Make a nice callback, then enable this back.
+	// let dbg_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+	// 	.pfn_user_callback(Some(vulkan_debug_message_callback));
+	// let dbg_messenger = debug_utils.create_debug_utils_messenger(&dbg_messenger_create_info, None)?;
 
 	let surface_create_info = vk::Win32SurfaceCreateInfoKHR::builder()
 		.hinstance(hinstance)
@@ -463,10 +472,21 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		khr_swapchain.destroy_swapchain(swapchain, None);
 		khr_surface.destroy_surface(surface, None);
 		device.destroy_device(None);
+		// debug_utils.destroy_debug_utils_messenger(dbg_messenger, None);
 		instance.destroy_instance(None);
 	}
 
 	Ok(())
+}
+
+unsafe extern "system" fn vulkan_debug_message_callback(
+	message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+	message_types: vk::DebugUtilsMessageTypeFlagsEXT,
+	p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+	p_user_data: *mut c_void,
+) -> vk::Bool32 {
+	eprintln!("{} [{:?}] Validation issue:\n{:#?}", message_severity.as_raw(), message_types, *p_callback_data);
+	vk::FALSE
 }
 
 fn read_spv(path: &Path) -> Result<Vec<u32>, io::Error> {

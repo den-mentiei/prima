@@ -13,3 +13,7 @@ It is dangerous to go alone, take this:
   ```bash
   $ scoop install glslang
   ```
+
+## Links
+
+- [Vulkan 1.3 full spec](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/)
