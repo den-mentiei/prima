@@ -7,14 +7,19 @@ use std::fs;
 use std::io;
 use std::io::Read;
 use std::path::Path;
+use std::ptr;
 use std::slice;
 use std::str;
 
 use ash::{vk, Entry};
 use ash::extensions::{ext, khr};
 
+use ffi::*;
+
 const WIDTH:  u32 = 800;
 const HEIGHT: u32 = 600;
+
+const WINDOW_CLASS_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"PRIMA_CLASS\0") };
 
 // TODO: Handle window resizing.
 
@@ -24,30 +29,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 unsafe fn work() -> Result<(), Box<dyn Error>> {
-	use core::ptr;
-	use ffi::*;
+	let hinstance = GetModuleHandleA(ptr::null());
 
-	let hinstance = unsafe { GetModuleHandleA(ptr::null()) };
-
-	let class_name = CStr::from_bytes_with_nul_unchecked(b"PRIMA_CLASS\0");
-
-	let mut wc = WNDCLASSA::default();
-	wc.lpfnWndProc = Some(window_procedure);
-	wc.hInstance = hinstance;
-	wc.lpszClassName = class_name.as_ptr();
-	wc.hCursor = unsafe { LoadCursorA(ptr::null_mut(), IDC_ARROW) };
-
-	let atom = unsafe { RegisterClassA(&wc) };
-	if atom == 0 {
-		let last_error = unsafe { GetLastError() };
-		panic!("Failed to register the window class, error code = {last_error}");
-	}
+	let atom = register_window_class(hinstance);
 
 	let window_name = CStr::from_bytes_with_nul_unchecked(b"Prima!\0");
-	let hwnd = unsafe {
-		CreateWindowExA(
+	let hwnd = CreateWindowExA(
 			0,
-			class_name.as_ptr(),
+			WINDOW_CLASS_NAME.as_ptr(),
 			window_name.as_ptr(),
 			WS_OVERLAPPEDWINDOW,
 			// TODO: Center the window or load/save the last position.
@@ -60,8 +49,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			ptr::null_mut(),
 			hinstance,
 			ptr::null_mut(),
-		)
-	};
+	);
 
 	if hwnd.is_null() {
 		panic!("Failed to create a window.");
@@ -291,6 +279,46 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	assert!(!cmd_buffers.is_empty());
 	let cmd_buffer = cmd_buffers[0];
 
+	let descriptor_set_layout_binding = vk::DescriptorSetLayoutBinding::builder()
+		.binding(0)
+		.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+		.descriptor_count(1)
+		.stage_flags(vk::ShaderStageFlags::VERTEX);
+
+	let descriptor_set_layout_create_info = vk::DescriptorSetLayoutCreateInfo::builder()
+		.bindings(slice::from_ref(&descriptor_set_layout_binding));
+	let descriptor_set_layout = device.create_descriptor_set_layout(&descriptor_set_layout_create_info, None)?;
+
+	let buffer_create_info = vk::BufferCreateInfo::builder()
+		.size(64 * 1024)
+		.usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+		.sharing_mode(vk::SharingMode::EXCLUSIVE);
+	let buffer = device.create_buffer(&buffer_create_info, None)?;
+
+	let mem_req       = device.get_buffer_memory_requirements(buffer);
+	let mem_props     = instance.get_physical_device_memory_properties(physical_device);
+	let mut mem_index = None;
+	let host_coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+	for i in 0..mem_props.memory_type_count {
+		let mem_type_is_fine   = mem_req.memory_type_bits & (1 << i) != 0;
+		let mem_type_flags     = mem_props.memory_types[i as usize].property_flags;
+		let mem_flags_are_fine = mem_type_flags.contains(host_coherent);
+		if mem_type_is_fine && mem_flags_are_fine {
+			mem_index = Some(i);
+		}
+	}
+	let Some(mem_index) = mem_index else {
+		panic!("Failed to find a suitable SSBO memory.");
+	};
+
+	let mem_alloc_info = vk::MemoryAllocateInfo::builder()
+		.allocation_size(buffer_create_info.size)
+		.memory_type_index(mem_index);
+	let buffer_mem = device.allocate_memory(&mem_alloc_info, None)?;
+	let prima_data = device.map_memory(buffer_mem, 0, buffer_create_info.size, vk::MemoryMapFlags::default())?;
+
+	device.bind_buffer_memory(buffer, buffer_mem, 0)?;
+
 	let vs_shader_spv = read_spv(Path::new("shaders/tri.vert.spv"))?;
 	let shader_create_info = vk::ShaderModuleCreateInfo::builder()
 		.code(&vs_shader_spv);
@@ -382,7 +410,14 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			},
 		}
 
-		let (i, _is_suboptimal) = khr_swapchain.acquire_next_image(swapchain, u64::MAX, acquire_semaphore, vk::Fence::null())?;
+		let next_image = khr_swapchain.acquire_next_image(swapchain, u64::MAX, acquire_semaphore, vk::Fence::null());
+		let i = match next_image {
+			Ok((i, _)) => i,
+			Err(e) => {
+				eprintln!("Failed to get the next swapchain image due to {:?}", e);
+				break;
+			},
+		};
 
 		device.reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
 
@@ -476,7 +511,11 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			.wait_semaphores(slice::from_ref(&release_semaphore))
 			.swapchains(slice::from_ref(&swapchain))
 			.image_indices(slice::from_ref(&i));
-		khr_swapchain.queue_present(queue, &present_info)?;
+		let result = khr_swapchain.queue_present(queue, &present_info);
+		if result.is_err() {
+			eprintln!("Failed to present due to {:?}", result);
+			break;
+		}
 		device.device_wait_idle()?;
 	}
 
@@ -484,8 +523,14 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	unsafe {
 		device.device_wait_idle()?;
 
+		device.destroy_pipeline(tri_pipeline, None);
+		device.destroy_pipeline_layout(pipeline_layout, None);
 		device.destroy_shader_module(fs_shader, None);
 		device.destroy_shader_module(vs_shader, None);
+		device.destroy_buffer(buffer, None);
+		device.unmap_memory(buffer_mem);
+		device.free_memory(buffer_mem, None);
+		device.destroy_descriptor_set_layout(descriptor_set_layout, None);
 		device.destroy_command_pool(command_pool, None);
 		device.destroy_semaphore(release_semaphore, None);
 		device.destroy_semaphore(acquire_semaphore, None);
@@ -503,7 +548,25 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		instance.destroy_instance(None);
 	}
 
+	println!("Kthnx, bye!");
+
 	Ok(())
+}
+
+unsafe fn register_window_class(hinstance: HINSTANCE) -> ATOM {
+	let mut wc = WNDCLASSA::default();
+	wc.lpfnWndProc = Some(window_procedure);
+	wc.hInstance = hinstance;
+	wc.lpszClassName = WINDOW_CLASS_NAME.as_ptr();
+	wc.hCursor = LoadCursorA(ptr::null_mut(), IDC_ARROW);
+
+	let atom = RegisterClassA(&wc);
+	if atom == 0 {
+		let last_error = GetLastError();
+		panic!("Failed to register the window class, error code = {last_error}");
+	}
+
+	atom
 }
 
 unsafe fn image_barrier(
