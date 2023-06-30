@@ -1,2 +1,3 @@
-glslangValidator.exe .\tri.vert.glsl -V -o tri.vert.spv
-glslangValidator.exe .\tri.frag.glsl -V -o tri.frag.spv
+rm *.spv
+glslangValidator.exe .\tri.vert.glsl -V --target-env vulkan1.0 -o tri.vert.spv
+glslangValidator.exe .\tri.frag.glsl -V --target-env vulkan1.0 -o tri.frag.spv

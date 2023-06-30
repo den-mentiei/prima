@@ -289,13 +289,42 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		.bindings(slice::from_ref(&descriptor_set_layout_binding));
 	let descriptor_set_layout = device.create_descriptor_set_layout(&descriptor_set_layout_create_info, None)?;
 
-	let buffer_create_info = vk::BufferCreateInfo::builder()
-		.size(64 * 1024)
+	let max_frames_in_flight = 2;
+
+	let descriptor_sizes = [
+		vk::DescriptorPoolSize {
+			ty: vk::DescriptorType::STORAGE_BUFFER,
+			descriptor_count: max_frames_in_flight,
+		},
+	];
+	let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::builder()
+		.max_sets(max_frames_in_flight)
+		.pool_sizes(&descriptor_sizes);
+	let descriptor_pool = device.create_descriptor_pool(&descriptor_pool_create_info, None)?;
+
+	let set_layouts = vec![descriptor_set_layout; max_frames_in_flight as usize];
+	let descriptor_set_alloc_info = vk::DescriptorSetAllocateInfo::builder()
+		.descriptor_pool(descriptor_pool)
+		.set_layouts(&set_layouts);
+	let descriptor_sets = device.allocate_descriptor_sets(&descriptor_set_alloc_info)?;
+
+	let prima_size_per_frame = 64 * 1024;
+
+	let pbuffer_create_info = vk::BufferCreateInfo::builder()
+		.size(prima_size_per_frame * max_frames_in_flight as u64)
 		.usage(vk::BufferUsageFlags::STORAGE_BUFFER)
 		.sharing_mode(vk::SharingMode::EXCLUSIVE);
-	let buffer = device.create_buffer(&buffer_create_info, None)?;
+	let pbuffer = device.create_buffer(&pbuffer_create_info, None)?;
 
-	let mem_req       = device.get_buffer_memory_requirements(buffer);
+	let ibuffer_create_info = vk::BufferCreateInfo::builder()
+		.size(prima_size_per_frame * max_frames_in_flight as u64)
+		.usage(vk::BufferUsageFlags::INDEX_BUFFER)
+		.sharing_mode(vk::SharingMode::EXCLUSIVE);
+	let ibuffer = device.create_buffer(&ibuffer_create_info, None)?;
+	// @Incomplete Need to check the requirements, as well.
+	// Sub-allocate, etc.
+
+	let mem_req       = device.get_buffer_memory_requirements(pbuffer);
 	let mem_props     = instance.get_physical_device_memory_properties(physical_device);
 	let mut mem_index = None;
 	let host_coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -311,13 +340,41 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		panic!("Failed to find a suitable SSBO memory.");
 	};
 
+	let total_memory   = pbuffer_create_info.size + ibuffer_create_info.size;
 	let mem_alloc_info = vk::MemoryAllocateInfo::builder()
-		.allocation_size(buffer_create_info.size)
+		.allocation_size(total_memory)
 		.memory_type_index(mem_index);
 	let buffer_mem = device.allocate_memory(&mem_alloc_info, None)?;
-	let prima_data = device.map_memory(buffer_mem, 0, buffer_create_info.size, vk::MemoryMapFlags::default())?;
 
-	device.bind_buffer_memory(buffer, buffer_mem, 0)?;
+	device.bind_buffer_memory(pbuffer, buffer_mem, 0)?;
+	device.bind_buffer_memory(ibuffer, buffer_mem, pbuffer_create_info.size)?;
+
+	let buffer_ptr  = device.map_memory(buffer_mem, 0, total_memory, vk::MemoryMapFlags::default())?;
+	let buffer_data = slice::from_raw_parts_mut(buffer_ptr as *mut u8, total_memory as usize);
+
+	let pbuffer_size = pbuffer_create_info.size as usize;
+
+	let (pbuffers, ibuffers) = buffer_data.split_at_mut(pbuffer_size);
+
+	let (pb0, pb1) = pbuffers.split_at_mut(prima_size_per_frame as usize);
+	let pbuffers   = [pb0, pb1];
+
+	let (ib0, ib1) = ibuffers.split_at_mut(prima_size_per_frame as usize);
+	let ibuffers   = [ib0, ib1];
+
+	for (i, set) in descriptor_sets.iter().enumerate() {
+		let buffer_info = vk::DescriptorBufferInfo::builder()
+			.buffer(pbuffer)
+			.offset(i as u64 * prima_size_per_frame)
+			.range(prima_size_per_frame);
+		let descriptor_write = vk::WriteDescriptorSet::builder()
+			.dst_set(*set)
+			.dst_binding(0)
+			.dst_array_element(0)
+			.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+			.buffer_info(slice::from_ref(&buffer_info));
+		device.update_descriptor_sets(slice::from_ref(&descriptor_write), &[]);
+	}
 
 	let vs_shader_spv = read_spv(Path::new("shaders/tri.vert.spv"))?;
 	let shader_create_info = vk::ShaderModuleCreateInfo::builder()
@@ -372,7 +429,8 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	let dynamic_states = vk::PipelineDynamicStateCreateInfo::builder()
 		.dynamic_states(&dynamic_states);
 
-	let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::default();
+	let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::builder()
+		.set_layouts(slice::from_ref(&descriptor_set_layout));
 	let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_create_info, None)?;
 
 	let gfx_pipeline_create_info = vk::GraphicsPipelineCreateInfo::builder()
@@ -397,16 +455,23 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 
 	let mut msg = MSG::default();
 	loop {
-		let got_msg = unsafe { GetMessageA(&mut msg, ptr::null_mut(), 0, 0) };
+		// Lazy drawing.
+		// let got_msg = unsafe { GetMessageA(&mut msg, ptr::null_mut(), 0, 0) };
+		// The usual v-synced drawing.
+		let got_msg = unsafe { PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) };
 		match got_msg {
-			0  => break,
+			0  => (), // Execute the rendering code below.
 			-1 => {
 				let last_error = unsafe { GetLastError() };
-				panic!("Failed to register the window class, error code = {last_error}");
+				panic!("Failed to peek window messages, error code = {last_error}");
 			},
 			_ => unsafe {
 				TranslateMessage(&msg);
 				DispatchMessageA(&msg);
+
+				if msg.message == WM_QUIT {
+					break;
+				}
 			},
 		}
 
@@ -418,6 +483,172 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 				break;
 			},
 		};
+
+		// Preparation
+
+		// @Incomplete Cleanup and make the double-buffered scheme more elegant.
+		// There is no need to acquire an image to know which index to write.
+
+		let mut indices = 0;
+		let ibuffer_offset = i as u64 * prima_size_per_frame;
+
+		let w = swapchain_extent.width  as f32;
+		let h = swapchain_extent.height as f32;
+		let l = 0.0;
+		let r = l + w;
+		let t = 0.0;
+		let b = t + h;
+		let n = 0.0;
+		let f = 1.0;
+		let proj = [
+			[
+				2.0 / (r - l),
+				0.0,
+				0.0,
+				0.0,
+			],
+			[
+				0.0,
+				2.0 / (b - t),
+				0.0,
+				0.0,
+			],
+			[
+				0.0,
+				0.0,
+				1.0 / (n - f),
+				0.0,
+			],
+			[
+				-(r + l) / (r - l),
+				-(b + t) / (b - t),
+				n / (n - f),
+				1.0,
+			],
+		];
+
+		//
+		// Index is encoded as follows:
+		//
+		// [31:27] [26:25] [24:0]
+		//    |       |       |
+		//    |       |       +------- offset info prima buffer
+		//    |       +--------------- rect corner id
+		//    +----------------------- primitive type
+		//
+		// Prima buffer at offset will contain primitive type
+		// specific data.
+		//
+		// Supported primitive types & their data:
+		//
+		// * PRIMA_TRIANGLE:
+		//
+		//   Buffer data:
+		//
+		//   struct TriVertex {
+		//     x: f32,
+		//     y: f32,
+		//   };
+		//
+		//   Indices: (0, 1, 2)
+		//
+		// * PRIMA_RECT:
+		//
+		//   Buffer data:
+		//
+		//   struct Rect {
+		//     x: f32,
+		//     y: f32,
+		//     w: f32,
+		//     h: f32,
+		//   };
+		//
+		//   Indices:
+		//
+		//     1 +--+ 2
+		//       | /|
+		//       |/ |
+		//     0 +__+ 3
+		//
+		//     (0, 1, 2, 2, 3, 0)
+		//
+
+		// @Cleanup This is shitty, but I'm pretty tired today :)
+		{
+			let mut offset = 0; // First ever primitive.
+			let op = pbuffers[i as usize].as_mut_ptr() as *mut f32;
+			let p = pbuffers[i as usize].as_mut_ptr() as *mut f32;
+			let i = ibuffers[i as usize].as_mut_ptr() as *mut u32;
+
+			p.copy_from(proj.as_ptr() as *const f32, 16);
+			let p = p.add(16);
+			offset += 16;
+
+			const PRIMA_TRI:  u32 = 0;
+			const PRIMA_RECT: u32 = 1;
+
+			const fn make_index(offset: u32, p_type: u32, corner: u8) -> u32 {
+				(p_type << 26) | ((corner as u32) << 24) | (offset as u32)
+			}
+
+			// Rect.
+
+			let p_type = PRIMA_RECT;
+
+			let rect_indices = [
+				make_index(offset, p_type, 0),
+				make_index(offset, p_type, 1),
+				make_index(offset, p_type, 2),
+				make_index(offset, p_type, 2),
+				make_index(offset, p_type, 3),
+				make_index(offset, p_type, 0),
+			];
+
+			p.add(0).write_unaligned(50.0);  // x
+			p.add(1).write_unaligned(150.0); // y
+			p.add(2).write_unaligned(200.0); // w
+			p.add(3).write_unaligned(120.0); // h
+			let p = p.add(4);
+			offset += 4;
+
+			for (offset, index) in rect_indices.into_iter().enumerate() {
+				i.add(offset).write_unaligned(index);
+				indices += 1;
+			}
+			let i = i.add(indices);
+
+			// Triangle
+
+			let p_type = PRIMA_TRI;
+
+			let tri_indices = [
+				make_index(offset,     p_type, 0),
+				make_index(offset + 3, p_type, 0),
+				make_index(offset + 6, p_type, 0),
+ 			];
+
+			let v0 = (w * 0.5,  h * 0.25);
+			let v1 = (w * 0.25, h * 0.75);
+			let v2 = (w * 0.75, h * 0.75);
+
+			p.add(0).write_unaligned(v0.0);
+			p.add(1).write_unaligned(v0.1);
+			p.add(2).cast::<u32>().write_unaligned(0xFF0000FF); // v0.c (1.0, 0.0, 0.0, 1.0)
+			p.add(3).write_unaligned(v1.0);
+			p.add(4).write_unaligned(v1.1);
+			p.add(5).cast::<u32>().write_unaligned(0xFF00FF00); // v1.c (0.0, 1.0, 0.0, 1.0)
+			p.add(6).write_unaligned(v2.0);
+			p.add(7).write_unaligned(v2.1);
+			p.add(8).cast::<u32>().write_unaligned(0xFFFF0000); // v2.c (0.0, 0.0, 1.0, 1.0)
+			offset += 9;
+
+			for (offset, index) in tri_indices.into_iter().enumerate() {
+				i.add(offset).write_unaligned(index);
+				indices += 1;
+			}
+		}
+
+		// Rendering
 
 		device.reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
 
@@ -458,8 +689,16 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 			})
 			.clear_values(slice::from_ref(&clear_value));
 
-
 		device.cmd_begin_render_pass(cmd_buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
+
+		device.cmd_bind_descriptor_sets(
+			cmd_buffer,
+			vk::PipelineBindPoint::GRAPHICS,
+			pipeline_layout,
+			0,
+			slice::from_ref(&descriptor_sets[i as usize]),
+			&[]);
+		device.cmd_bind_index_buffer(cmd_buffer, ibuffer, ibuffer_offset, vk::IndexType::UINT32);
 
 		let viewport = vk::Viewport {
 			x: 0.0,
@@ -476,7 +715,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		device.cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
 		device.cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&scissor));
 		device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, tri_pipeline);
-		device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
+		device.cmd_draw_indexed(cmd_buffer, indices as u32, 1, 0, 0, 0);
 
 		device.cmd_end_render_pass(cmd_buffer);
 
@@ -527,7 +766,9 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		device.destroy_pipeline_layout(pipeline_layout, None);
 		device.destroy_shader_module(fs_shader, None);
 		device.destroy_shader_module(vs_shader, None);
-		device.destroy_buffer(buffer, None);
+		device.destroy_buffer(ibuffer, None);
+		device.destroy_buffer(pbuffer, None);
+		device.destroy_descriptor_pool(descriptor_pool, None);
 		device.unmap_memory(buffer_mem);
 		device.free_memory(buffer_mem, None);
 		device.destroy_descriptor_set_layout(descriptor_set_layout, None);
@@ -628,7 +869,7 @@ unsafe extern "stdcall" fn window_procedure(
 	use ffi::*;
 
 	match uMsg {
-		WM_CLOSE   => drop(DestroyWindow(hwnd)),
+		WM_CLOSE | WM_KEYDOWN if wParam == VK_ESCAPE => drop(DestroyWindow(hwnd)),
 		WM_DESTROY => PostQuitMessage(0),
 		_ => return DefWindowProcA(hwnd, uMsg, wParam, lParam),
 	};
@@ -686,8 +927,14 @@ mod ffi {
 
 	pub const SW_SHOW: ffi::c_int = 5;
 
-	pub const WM_CLOSE: u32   = 0x0010;
+	pub const PM_REMOVE:  u32 = 0x0001;
+
 	pub const WM_DESTROY: u32 = 0x0002;
+	pub const WM_CLOSE:   u32 = 0x0010;
+	pub const WM_QUIT:    u32 = 0x0012;
+	pub const WM_KEYDOWN: u32 = 0x0100;
+
+	pub const VK_ESCAPE: usize = 0x1B;
 
 	pub const fn MAKEINTRESOURCEA(i: WORD) -> LPCSTR {
 		i as ULONG_PTR as LPCSTR
@@ -805,6 +1052,14 @@ mod ffi {
 			wParam: WPARAM,
 			lParam: LPARAM,
 		) -> LRESULT;
+
+		pub fn PeekMessageA(
+			lpMsg: *const MSG,
+			hWnd: HWND,
+			wMsgFilterMin: UINT,
+			wMsgFilterMax: UINT,
+			wRemoveMsg: UINT,
+		) -> BOOL;
 
 		pub fn GetMessageA(
 			lpMsg: *const MSG,
