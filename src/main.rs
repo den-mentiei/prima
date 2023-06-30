@@ -4,7 +4,6 @@
 use std::error::Error;
 use std::ffi::{c_void, CStr};
 use std::fs;
-use std::io;
 use std::io::Read;
 use std::path::Path;
 use std::ptr;
@@ -21,66 +20,23 @@ const HEIGHT: u32 = 600;
 
 const WINDOW_CLASS_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"PRIMA_CLASS\0") };
 
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
 // TODO: Handle window resizing.
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
 	println!("Hello, sailor!");
 	unsafe { work() }
 }
 
-unsafe fn work() -> Result<(), Box<dyn Error>> {
+unsafe fn work() -> Result<()> {
 	let hinstance = GetModuleHandleA(ptr::null());
 
 	let atom = register_window_class(hinstance);
+	let hwnd = create_window(hinstance, WIDTH, HEIGHT);
 
-	let window_name = CStr::from_bytes_with_nul_unchecked(b"Prima!\0");
-	let hwnd = CreateWindowExA(
-			0,
-			WINDOW_CLASS_NAME.as_ptr(),
-			window_name.as_ptr(),
-			WS_OVERLAPPEDWINDOW,
-			// TODO: Center the window or load/save the last position.
-			CW_USEDEFAULT,
-			CW_USEDEFAULT,
-			// TODO: Deal with scaling/HI-DPI & window title.
-			WIDTH as i32,
-			HEIGHT as i32,
-			ptr::null_mut(),
-			ptr::null_mut(),
-			hinstance,
-			ptr::null_mut(),
-	);
-
-	if hwnd.is_null() {
-		panic!("Failed to create a window.");
-	}
-
-	let entry = Entry::load()?;
-
-	// TODO: Enable validation layer (`VK_LAYER_KHRONOS_validation`).
-	// and setup the debug callback to print messages.
-
-	let app_info = vk::ApplicationInfo {
-		api_version: vk::make_api_version(0, 1, 0, 0),
-		..Default::default()
-	};
-
-	let instance_extensions = [
-		khr::Surface::name().as_ptr(),
-		khr::Win32Surface::name().as_ptr(),
-		ext::DebugUtils::name().as_ptr(),
-	];
-	let layers = [
-		// TODO: Make it a debug/cmd-line flag only.
-		CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0").as_ptr(),
-	];
-
-	let create_info = vk::InstanceCreateInfo::builder()
-		.application_info(&app_info)
-		.enabled_extension_names(&instance_extensions)
-		.enabled_layer_names(&layers);
-
-	let instance = entry.create_instance(&create_info, None)?;
+	let entry    = Entry::load()?;
+	let instance = create_instance(&entry)?;
 
 	let debug_utils = ext::DebugUtils::new(&entry, &instance);
 
@@ -94,51 +50,25 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		.hinstance(hinstance)
 		.hwnd(hwnd);
 
-	let khr_surface = khr::Surface::new(&entry, &instance);
-
+	let khr_surface     = khr::Surface::new(&entry, &instance);
 	let khr_w32_surface = khr::Win32Surface::new(&entry, &instance);
-	let surface = khr_w32_surface.create_win32_surface(&surface_create_info, None)?;
+	let surface         = khr_w32_surface.create_win32_surface(&surface_create_info, None)?;
 
-	let physical_devices = instance.enumerate_physical_devices()?;
-
-	let (physical_device, queue_family) = physical_devices
-		.iter()
-		.find_map(|pdevice| {
-			instance
-				.get_physical_device_queue_family_properties(*pdevice)
-				.iter()
-				.enumerate()
-				.find_map(|(i, props)| {
-					let has_gfx     = props.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-					let can_present = khr_surface.get_physical_device_surface_support(*pdevice, i as u32, surface).ok()?;
-					if has_gfx && can_present {
-						Some((*pdevice, i as u32))
-					} else {
-						None
-					}
-				})
-		})
-		.expect("Failed to find a suitable physical device.");
+	let (physical_device, queue_family) = pick_physical_device_and_queue_family(
+		&instance,
+		&khr_surface,
+		surface,
+	)?;
 
 	let props = instance.get_physical_device_properties(physical_device);
 	let name  = str_from_null_terminated_bytes(&props.device_name);
 	println!("Using the following physical device: {:?} ({:?})", name, props.device_type);
 
-	let queue_priority = [1.0];
-
-	let queue_create_info = vk::DeviceQueueCreateInfo::builder()
-		.queue_family_index(queue_family)
-		.queue_priorities(&queue_priority);
-
-	let device_extensions = [
-		khr::Swapchain::name().as_ptr(),
-	];
-	let device_create_info = vk::DeviceCreateInfo::builder()
-		.queue_create_infos(slice::from_ref(&queue_create_info))
-		.enabled_extension_names(&device_extensions);
-
-	let device = instance.create_device(physical_device, &device_create_info, None)?;
-	let queue  = device.get_device_queue(queue_family, 0);
+	let (device, queue) = create_device_and_queue(
+		&instance,
+		physical_device,
+		queue_family,
+	)?;
 
 	let surface_formats = khr_surface.get_physical_device_surface_formats(physical_device, surface)?;
 	println!("Swapchain supported swapchain formats: {:#?}", surface_formats);
@@ -161,15 +91,7 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	let surface_caps = khr_surface.get_physical_device_surface_capabilities(physical_device, surface)?;
 	println!("{:#?}", surface_caps);
 
-	let mut client_rect = RECT::default();
-	let err = unsafe { GetClientRect(hwnd, &mut client_rect) };
-	if err != 1 {
-		panic!("Failed to get window client rect.");
-	}
-	let window_client_size = (
-		(client_rect.right - client_rect.left) as u32,
-		(client_rect.bottom - client_rect.top) as u32,
-	);
+	let window_client_size = get_window_client_size(hwnd);
 	println!("Window client size: {:?}", window_client_size);
 
 	let swapchain_size = (
@@ -376,6 +298,447 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 		device.update_descriptor_sets(slice::from_ref(&descriptor_write), &[]);
 	}
 
+	let tri_pipeline = create_tri_pipeline(&device, render_pass, descriptor_set_layout)?;
+
+	unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+	let mut msg = MSG::default();
+	loop {
+		// Lazy drawing.
+		// let got_msg = unsafe { GetMessageA(&mut msg, ptr::null_mut(), 0, 0) };
+		// The usual v-synced drawing.
+		let got_msg = unsafe { PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) };
+		match got_msg {
+			0  => (), // Execute the rendering code below.
+			-1 => {
+				let last_error = unsafe { GetLastError() };
+				panic!("Failed to peek window messages, error code = {last_error}");
+			},
+			_ => unsafe {
+				TranslateMessage(&msg);
+				DispatchMessageA(&msg);
+
+				if msg.message == WM_QUIT {
+					break;
+				}
+			},
+		}
+
+		let next_image = khr_swapchain.acquire_next_image(swapchain, u64::MAX, acquire_semaphore, vk::Fence::null());
+		let i = match next_image {
+			Ok((i, _)) => i,
+			Err(e) => {
+				eprintln!("Failed to get the next swapchain image due to {:?}", e);
+				break;
+			},
+		};
+
+		// Preparation
+
+		// @Incomplete Cleanup and make the double-buffered scheme more elegant.
+		// There is no need to acquire an image to know which index to write.
+
+		let w = swapchain_extent.width  as f32;
+		let h = swapchain_extent.height as f32;
+
+		let pbuf    = pbuffers[i as usize].as_mut_ptr() as *mut f32;
+		let ibuf    = ibuffers[i as usize].as_mut_ptr() as *mut u32;
+		let indices = fill_prima_buffers(w, h, pbuf, ibuf);
+
+		// Rendering
+
+		device.reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
+
+		let cmd_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
+			.flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+		device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
+
+		let image = swapchain_images[i as usize];
+		let render_begin_barrier = image_barrier(
+			&image,
+			vk::AccessFlags::empty(),
+			vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+			vk::ImageLayout::UNDEFINED,
+			vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+		);
+		device.cmd_pipeline_barrier(
+			cmd_buffer,
+			vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+			vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+			vk::DependencyFlags::BY_REGION,
+			&[],
+			&[],
+			slice::from_ref(&render_begin_barrier),
+		);
+
+		let mut clear_color = vk::ClearColorValue::default();
+		clear_color.float32 = [0.4, 0.6, 0.45, 1.0];
+
+		let mut clear_value = vk::ClearValue::default();
+		clear_value.color   = clear_color;
+
+		let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
+			.render_pass(render_pass)
+			.framebuffer(swapchain_framebuffers[i as usize])
+			.render_area(vk::Rect2D {
+				offset: vk::Offset2D::default(),
+				extent: *swapchain_extent,
+			})
+			.clear_values(slice::from_ref(&clear_value));
+
+		device.cmd_begin_render_pass(cmd_buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
+
+		device.cmd_bind_descriptor_sets(
+			cmd_buffer,
+			vk::PipelineBindPoint::GRAPHICS,
+			tri_pipeline.layout,
+			0,
+			slice::from_ref(&descriptor_sets[i as usize]),
+			&[]);
+		let ibuffer_offset = i as u64 * prima_size_per_frame;
+		device.cmd_bind_index_buffer(cmd_buffer, ibuffer, ibuffer_offset, vk::IndexType::UINT32);
+
+		let viewport = vk::Viewport {
+			x: 0.0,
+			y: 0.0,
+			width:  swapchain_extent.width  as f32,
+			height: swapchain_extent.height as f32,
+			min_depth: 0.0,
+			max_depth: 0.1,
+		};
+		let scissor = vk::Rect2D {
+			offset: vk::Offset2D::default(),
+			extent: *swapchain_extent,
+		};
+		device.cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
+		device.cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&scissor));
+		device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, tri_pipeline.handle);
+		device.cmd_draw_indexed(cmd_buffer, indices as u32, 1, 0, 0, 0);
+
+		device.cmd_end_render_pass(cmd_buffer);
+
+		let render_end_barrier = image_barrier(
+			&image,
+			vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+			vk::AccessFlags::empty(),
+			vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+			vk::ImageLayout::PRESENT_SRC_KHR,
+		);
+		device.cmd_pipeline_barrier(
+			cmd_buffer,
+			vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+			vk::PipelineStageFlags::TOP_OF_PIPE,
+			vk::DependencyFlags::BY_REGION,
+			&[],
+			&[],
+			slice::from_ref(&render_end_barrier),
+		);
+
+		device.end_command_buffer(cmd_buffer)?;
+
+		let submit_stage_mask = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+		let submit_info       = vk::SubmitInfo::builder()
+			.wait_semaphores(slice::from_ref(&acquire_semaphore))
+			.signal_semaphores(slice::from_ref(&release_semaphore))
+			.wait_dst_stage_mask(slice::from_ref(&submit_stage_mask))
+			.command_buffers(slice::from_ref(&cmd_buffer));
+		device.queue_submit(queue, slice::from_ref(&*submit_info), vk::Fence::null())?;
+
+		let present_info = vk::PresentInfoKHR::builder()
+			.wait_semaphores(slice::from_ref(&release_semaphore))
+			.swapchains(slice::from_ref(&swapchain))
+			.image_indices(slice::from_ref(&i));
+		let result = khr_swapchain.queue_present(queue, &present_info);
+		if result.is_err() {
+			eprintln!("Failed to present due to {:?}", result);
+			break;
+		}
+		device.device_wait_idle()?;
+	}
+
+	// TODO: @bug Do a drop/defer guards for this.
+	unsafe {
+		device.device_wait_idle()?;
+
+		device.destroy_pipeline(tri_pipeline.handle, None);
+		device.destroy_pipeline_layout(tri_pipeline.layout, None);
+		device.destroy_buffer(ibuffer, None);
+		device.destroy_buffer(pbuffer, None);
+		device.destroy_descriptor_pool(descriptor_pool, None);
+		device.unmap_memory(buffer_mem);
+		device.free_memory(buffer_mem, None);
+		device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+		device.destroy_command_pool(command_pool, None);
+		device.destroy_semaphore(release_semaphore, None);
+		device.destroy_semaphore(acquire_semaphore, None);
+		for framebuffer in swapchain_framebuffers {
+			device.destroy_framebuffer(framebuffer, None);
+		}
+		device.destroy_render_pass(render_pass, None);
+		for image_view in swapchain_image_views {
+			device.destroy_image_view(image_view, None);
+		}
+		khr_swapchain.destroy_swapchain(swapchain, None);
+		khr_surface.destroy_surface(surface, None);
+		device.destroy_device(None);
+		// debug_utils.destroy_debug_utils_messenger(dbg_messenger, None);
+		instance.destroy_instance(None);
+	}
+
+	println!("Kthnx, bye!");
+
+	Ok(())
+}
+
+//
+// Index is encoded as follows:
+//
+// [31:27] [26:25] [24:0]
+//    |       |       |
+//    |       |       +------- offset info prima buffer
+//    |       +--------------- rect corner id
+//    +----------------------- primitive type
+//
+// Prima buffer at offset will contain primitive type
+// specific data.
+//
+// Supported primitive types & their data:
+//
+// * PRIMA_TRIANGLE:
+//
+//   Buffer data:
+//
+//   struct TriVertex {
+//     x: f32,
+//     y: f32,
+//   };
+//
+//   Indices: (0, 1, 2)
+//
+// * PRIMA_RECT:
+//
+//   Buffer data:
+//
+//   struct Rect {
+//     x: f32,
+//     y: f32,
+//     w: f32,
+//     h: f32,
+//   };
+//
+//   Indices:
+//
+//     1 +--+ 2
+//       | /|
+//       |/ |
+//     0 +__+ 3
+//
+//     (0, 1, 2, 2, 3, 0)
+//
+unsafe fn fill_prima_buffers(w: f32, h: f32, p: *mut f32, i: *mut u32) -> usize {
+	let mut indices = 0;
+	let mut offset  = 0; // First ever primitive.
+
+	let proj = ortho_projection(w, h);
+	p.copy_from(proj.as_ptr() as *const f32, 16);
+	let p = p.add(16);
+	offset += 16;
+
+	const PRIMA_TRI:  u32 = 0;
+	const PRIMA_RECT: u32 = 1;
+
+	const fn make_index(offset: u32, p_type: u32, corner: u8) -> u32 {
+		(p_type << 26) | ((corner as u32) << 24) | (offset as u32)
+	}
+
+	// Rect.
+
+	let p_type = PRIMA_RECT;
+
+	let rect_indices = [
+		make_index(offset, p_type, 0),
+		make_index(offset, p_type, 1),
+		make_index(offset, p_type, 2),
+		make_index(offset, p_type, 2),
+		make_index(offset, p_type, 3),
+		make_index(offset, p_type, 0),
+	];
+
+	p.add(0).write_unaligned(50.0);  // x
+	p.add(1).write_unaligned(150.0); // y
+	p.add(2).write_unaligned(200.0); // w
+	p.add(3).write_unaligned(120.0); // h
+	let p = p.add(4);
+	offset += 4;
+
+	for (offset, index) in rect_indices.into_iter().enumerate() {
+		i.add(offset).write_unaligned(index);
+		indices += 1;
+	}
+	let i = i.add(indices);
+
+	// Triangle
+
+	let p_type = PRIMA_TRI;
+
+	let tri_indices = [
+		make_index(offset,     p_type, 0),
+		make_index(offset + 3, p_type, 0),
+		make_index(offset + 6, p_type, 0),
+ 	];
+
+	let v0 = (w * 0.5,  h * 0.25);
+	let v1 = (w * 0.25, h * 0.75);
+	let v2 = (w * 0.75, h * 0.75);
+
+	p.add(0).write_unaligned(v0.0);
+	p.add(1).write_unaligned(v0.1);
+	p.add(2).cast::<u32>().write_unaligned(0xFF0000FF); // v0.c (1.0, 0.0, 0.0, 1.0)
+	p.add(3).write_unaligned(v1.0);
+	p.add(4).write_unaligned(v1.1);
+	p.add(5).cast::<u32>().write_unaligned(0xFF00FF00); // v1.c (0.0, 1.0, 0.0, 1.0)
+	p.add(6).write_unaligned(v2.0);
+	p.add(7).write_unaligned(v2.1);
+	p.add(8).cast::<u32>().write_unaligned(0xFFFF0000); // v2.c (0.0, 0.0, 1.0, 1.0)
+	offset += 9;
+
+	for (offset, index) in tri_indices.into_iter().enumerate() {
+		i.add(offset).write_unaligned(index);
+		indices += 1;
+	}
+
+	indices
+}
+
+fn ortho_projection(w: f32, h: f32) -> [[f32; 4]; 4] {
+	let l = 0.0;
+	let r = l + w;
+	let t = 0.0;
+	let b = t + h;
+	let n = 0.0;
+	let f = 1.0;
+	let proj = [
+		[
+			2.0 / (r - l),
+			0.0,
+			0.0,
+			0.0,
+		],
+		[
+			0.0,
+			2.0 / (b - t),
+			0.0,
+			0.0,
+		],
+		[
+			0.0,
+			0.0,
+			1.0 / (n - f),
+			0.0,
+		],
+		[
+			-(r + l) / (r - l),
+			-(b + t) / (b - t),
+			n / (n - f),
+			1.0,
+		],
+	];
+
+	proj
+}
+
+unsafe fn create_instance(entry: &Entry) -> Result<ash::Instance> {
+	// TODO: Enable validation layer (`VK_LAYER_KHRONOS_validation`).
+	// and setup the debug callback to print messages.
+
+	let app_info = vk::ApplicationInfo {
+		api_version: vk::make_api_version(0, 1, 0, 0),
+		..Default::default()
+	};
+
+	let instance_extensions = [
+		khr::Surface::name().as_ptr(),
+		khr::Win32Surface::name().as_ptr(),
+		ext::DebugUtils::name().as_ptr(),
+	];
+	let layers = [
+		// TODO: Make it a debug/cmd-line flag only.
+		CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0").as_ptr(),
+	];
+
+	let create_info = vk::InstanceCreateInfo::builder()
+		.application_info(&app_info)
+		.enabled_extension_names(&instance_extensions)
+		.enabled_layer_names(&layers);
+
+	let instance = entry.create_instance(&create_info, None)?;
+
+	Ok(instance)
+}
+
+struct Pipeline {
+	handle: vk::Pipeline,
+	layout: vk::PipelineLayout,
+}
+
+unsafe fn pick_physical_device_and_queue_family(
+	instance: &ash::Instance,
+	khr_surface: &khr::Surface,
+	surface: vk::SurfaceKHR,
+) -> Result<(vk::PhysicalDevice, u32)> {
+	let physical_devices = instance.enumerate_physical_devices()?;
+
+	let (physical_device, queue_family) = physical_devices
+		.iter()
+		.find_map(|pdevice| {
+			instance
+				.get_physical_device_queue_family_properties(*pdevice)
+				.iter()
+				.enumerate()
+				.find_map(|(i, props)| {
+					let has_gfx     = props.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+					let can_present = khr_surface.get_physical_device_surface_support(*pdevice, i as u32, surface).ok()?;
+					if has_gfx && can_present {
+						Some((*pdevice, i as u32))
+					} else {
+						None
+					}
+				})
+		})
+		.expect("Failed to find a suitable physical device.");
+
+	Ok((physical_device, queue_family))
+}
+
+unsafe fn create_device_and_queue(
+	instance: &ash::Instance,
+	physical_device: vk::PhysicalDevice,
+	queue_family: u32,
+) -> Result<(ash::Device, vk::Queue)> {
+	let queue_priority = [1.0];
+
+	let queue_create_info = vk::DeviceQueueCreateInfo::builder()
+		.queue_family_index(queue_family)
+		.queue_priorities(&queue_priority);
+
+	let device_extensions = [
+		khr::Swapchain::name().as_ptr(),
+	];
+	let device_create_info = vk::DeviceCreateInfo::builder()
+		.queue_create_infos(slice::from_ref(&queue_create_info))
+		.enabled_extension_names(&device_extensions);
+
+	let device = instance.create_device(physical_device, &device_create_info, None)?;
+	let queue  = device.get_device_queue(queue_family, 0);
+
+	Ok((device, queue))
+}
+
+unsafe fn create_tri_pipeline(
+	device: &ash::Device,
+	render_pass: vk::RenderPass,
+	descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<Pipeline> {
 	let vs_shader_spv = read_spv(Path::new("shaders/tri.vert.spv"))?;
 	let shader_create_info = vk::ShaderModuleCreateInfo::builder()
 		.code(&vs_shader_spv);
@@ -449,349 +812,16 @@ unsafe fn work() -> Result<(), Box<dyn Error>> {
 	let pipelines = device
 		.create_graphics_pipelines(pipeline_cache, slice::from_ref(&gfx_pipeline_create_info), None)
 		.expect("Failed to create a graphics pipeline.");
-	let tri_pipeline = pipelines[0];
 
-	unsafe { ShowWindow(hwnd, SW_SHOW) };
+	device.destroy_shader_module(fs_shader, None);
+	device.destroy_shader_module(vs_shader, None);
 
-	let mut msg = MSG::default();
-	loop {
-		// Lazy drawing.
-		// let got_msg = unsafe { GetMessageA(&mut msg, ptr::null_mut(), 0, 0) };
-		// The usual v-synced drawing.
-		let got_msg = unsafe { PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) };
-		match got_msg {
-			0  => (), // Execute the rendering code below.
-			-1 => {
-				let last_error = unsafe { GetLastError() };
-				panic!("Failed to peek window messages, error code = {last_error}");
-			},
-			_ => unsafe {
-				TranslateMessage(&msg);
-				DispatchMessageA(&msg);
+	let pipeline = Pipeline {
+		handle: pipelines[0],
+		layout: pipeline_layout,
+	};
 
-				if msg.message == WM_QUIT {
-					break;
-				}
-			},
-		}
-
-		let next_image = khr_swapchain.acquire_next_image(swapchain, u64::MAX, acquire_semaphore, vk::Fence::null());
-		let i = match next_image {
-			Ok((i, _)) => i,
-			Err(e) => {
-				eprintln!("Failed to get the next swapchain image due to {:?}", e);
-				break;
-			},
-		};
-
-		// Preparation
-
-		// @Incomplete Cleanup and make the double-buffered scheme more elegant.
-		// There is no need to acquire an image to know which index to write.
-
-		let mut indices = 0;
-		let ibuffer_offset = i as u64 * prima_size_per_frame;
-
-		let w = swapchain_extent.width  as f32;
-		let h = swapchain_extent.height as f32;
-		let l = 0.0;
-		let r = l + w;
-		let t = 0.0;
-		let b = t + h;
-		let n = 0.0;
-		let f = 1.0;
-		let proj = [
-			[
-				2.0 / (r - l),
-				0.0,
-				0.0,
-				0.0,
-			],
-			[
-				0.0,
-				2.0 / (b - t),
-				0.0,
-				0.0,
-			],
-			[
-				0.0,
-				0.0,
-				1.0 / (n - f),
-				0.0,
-			],
-			[
-				-(r + l) / (r - l),
-				-(b + t) / (b - t),
-				n / (n - f),
-				1.0,
-			],
-		];
-
-		//
-		// Index is encoded as follows:
-		//
-		// [31:27] [26:25] [24:0]
-		//    |       |       |
-		//    |       |       +------- offset info prima buffer
-		//    |       +--------------- rect corner id
-		//    +----------------------- primitive type
-		//
-		// Prima buffer at offset will contain primitive type
-		// specific data.
-		//
-		// Supported primitive types & their data:
-		//
-		// * PRIMA_TRIANGLE:
-		//
-		//   Buffer data:
-		//
-		//   struct TriVertex {
-		//     x: f32,
-		//     y: f32,
-		//   };
-		//
-		//   Indices: (0, 1, 2)
-		//
-		// * PRIMA_RECT:
-		//
-		//   Buffer data:
-		//
-		//   struct Rect {
-		//     x: f32,
-		//     y: f32,
-		//     w: f32,
-		//     h: f32,
-		//   };
-		//
-		//   Indices:
-		//
-		//     1 +--+ 2
-		//       | /|
-		//       |/ |
-		//     0 +__+ 3
-		//
-		//     (0, 1, 2, 2, 3, 0)
-		//
-
-		// @Cleanup This is shitty, but I'm pretty tired today :)
-		{
-			let mut offset = 0; // First ever primitive.
-			let op = pbuffers[i as usize].as_mut_ptr() as *mut f32;
-			let p = pbuffers[i as usize].as_mut_ptr() as *mut f32;
-			let i = ibuffers[i as usize].as_mut_ptr() as *mut u32;
-
-			p.copy_from(proj.as_ptr() as *const f32, 16);
-			let p = p.add(16);
-			offset += 16;
-
-			const PRIMA_TRI:  u32 = 0;
-			const PRIMA_RECT: u32 = 1;
-
-			const fn make_index(offset: u32, p_type: u32, corner: u8) -> u32 {
-				(p_type << 26) | ((corner as u32) << 24) | (offset as u32)
-			}
-
-			// Rect.
-
-			let p_type = PRIMA_RECT;
-
-			let rect_indices = [
-				make_index(offset, p_type, 0),
-				make_index(offset, p_type, 1),
-				make_index(offset, p_type, 2),
-				make_index(offset, p_type, 2),
-				make_index(offset, p_type, 3),
-				make_index(offset, p_type, 0),
-			];
-
-			p.add(0).write_unaligned(50.0);  // x
-			p.add(1).write_unaligned(150.0); // y
-			p.add(2).write_unaligned(200.0); // w
-			p.add(3).write_unaligned(120.0); // h
-			let p = p.add(4);
-			offset += 4;
-
-			for (offset, index) in rect_indices.into_iter().enumerate() {
-				i.add(offset).write_unaligned(index);
-				indices += 1;
-			}
-			let i = i.add(indices);
-
-			// Triangle
-
-			let p_type = PRIMA_TRI;
-
-			let tri_indices = [
-				make_index(offset,     p_type, 0),
-				make_index(offset + 3, p_type, 0),
-				make_index(offset + 6, p_type, 0),
- 			];
-
-			let v0 = (w * 0.5,  h * 0.25);
-			let v1 = (w * 0.25, h * 0.75);
-			let v2 = (w * 0.75, h * 0.75);
-
-			p.add(0).write_unaligned(v0.0);
-			p.add(1).write_unaligned(v0.1);
-			p.add(2).cast::<u32>().write_unaligned(0xFF0000FF); // v0.c (1.0, 0.0, 0.0, 1.0)
-			p.add(3).write_unaligned(v1.0);
-			p.add(4).write_unaligned(v1.1);
-			p.add(5).cast::<u32>().write_unaligned(0xFF00FF00); // v1.c (0.0, 1.0, 0.0, 1.0)
-			p.add(6).write_unaligned(v2.0);
-			p.add(7).write_unaligned(v2.1);
-			p.add(8).cast::<u32>().write_unaligned(0xFFFF0000); // v2.c (0.0, 0.0, 1.0, 1.0)
-			offset += 9;
-
-			for (offset, index) in tri_indices.into_iter().enumerate() {
-				i.add(offset).write_unaligned(index);
-				indices += 1;
-			}
-		}
-
-		// Rendering
-
-		device.reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
-
-		let cmd_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
-			.flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-		device.begin_command_buffer(cmd_buffer, &cmd_buffer_begin_info)?;
-
-		let image = swapchain_images[i as usize];
-		let render_begin_barrier = image_barrier(
-			&image,
-			vk::AccessFlags::empty(),
-			vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-			vk::ImageLayout::UNDEFINED,
-			vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-		);
-		device.cmd_pipeline_barrier(
-			cmd_buffer,
-			vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-			vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-			vk::DependencyFlags::BY_REGION,
-			&[],
-			&[],
-			slice::from_ref(&render_begin_barrier),
-		);
-
-		let mut clear_color = vk::ClearColorValue::default();
-		clear_color.float32 = [0.4, 0.6, 0.45, 1.0];
-
-		let mut clear_value = vk::ClearValue::default();
-		clear_value.color = clear_color;
-
-		let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
-			.render_pass(render_pass)
-			.framebuffer(swapchain_framebuffers[i as usize])
-			.render_area(vk::Rect2D {
-				offset: vk::Offset2D::default(),
-				extent: *swapchain_extent,
-			})
-			.clear_values(slice::from_ref(&clear_value));
-
-		device.cmd_begin_render_pass(cmd_buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
-
-		device.cmd_bind_descriptor_sets(
-			cmd_buffer,
-			vk::PipelineBindPoint::GRAPHICS,
-			pipeline_layout,
-			0,
-			slice::from_ref(&descriptor_sets[i as usize]),
-			&[]);
-		device.cmd_bind_index_buffer(cmd_buffer, ibuffer, ibuffer_offset, vk::IndexType::UINT32);
-
-		let viewport = vk::Viewport {
-			x: 0.0,
-			y: 0.0,
-			width:  swapchain_extent.width  as f32,
-			height: swapchain_extent.height as f32,
-			min_depth: 0.0,
-			max_depth: 0.1,
-		};
-		let scissor = vk::Rect2D {
-			offset: vk::Offset2D::default(),
-			extent: *swapchain_extent,
-		};
-		device.cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
-		device.cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&scissor));
-		device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, tri_pipeline);
-		device.cmd_draw_indexed(cmd_buffer, indices as u32, 1, 0, 0, 0);
-
-		device.cmd_end_render_pass(cmd_buffer);
-
-		let render_end_barrier = image_barrier(
-			&image,
-			vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-			vk::AccessFlags::empty(),
-			vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-			vk::ImageLayout::PRESENT_SRC_KHR,
-		);
-		device.cmd_pipeline_barrier(
-			cmd_buffer,
-			vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-			vk::PipelineStageFlags::TOP_OF_PIPE,
-			vk::DependencyFlags::BY_REGION,
-			&[],
-			&[],
-			slice::from_ref(&render_end_barrier),
-		);
-
-		device.end_command_buffer(cmd_buffer)?;
-
-		let submit_stage_mask = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
-		let submit_info = vk::SubmitInfo::builder()
-			.wait_semaphores(slice::from_ref(&acquire_semaphore))
-			.signal_semaphores(slice::from_ref(&release_semaphore))
-			.wait_dst_stage_mask(slice::from_ref(&submit_stage_mask))
-			.command_buffers(slice::from_ref(&cmd_buffer));
-		device.queue_submit(queue, slice::from_ref(&*submit_info), vk::Fence::null())?;
-
-		let present_info  = vk::PresentInfoKHR::builder()
-			.wait_semaphores(slice::from_ref(&release_semaphore))
-			.swapchains(slice::from_ref(&swapchain))
-			.image_indices(slice::from_ref(&i));
-		let result = khr_swapchain.queue_present(queue, &present_info);
-		if result.is_err() {
-			eprintln!("Failed to present due to {:?}", result);
-			break;
-		}
-		device.device_wait_idle()?;
-	}
-
-	// TODO: @bug Do a drop/defer guards for this.
-	unsafe {
-		device.device_wait_idle()?;
-
-		device.destroy_pipeline(tri_pipeline, None);
-		device.destroy_pipeline_layout(pipeline_layout, None);
-		device.destroy_shader_module(fs_shader, None);
-		device.destroy_shader_module(vs_shader, None);
-		device.destroy_buffer(ibuffer, None);
-		device.destroy_buffer(pbuffer, None);
-		device.destroy_descriptor_pool(descriptor_pool, None);
-		device.unmap_memory(buffer_mem);
-		device.free_memory(buffer_mem, None);
-		device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-		device.destroy_command_pool(command_pool, None);
-		device.destroy_semaphore(release_semaphore, None);
-		device.destroy_semaphore(acquire_semaphore, None);
-		for framebuffer in swapchain_framebuffers {
-			device.destroy_framebuffer(framebuffer, None);
-		}
-		device.destroy_render_pass(render_pass, None);
-		for image_view in swapchain_image_views {
-			device.destroy_image_view(image_view, None);
-		}
-		khr_swapchain.destroy_swapchain(swapchain, None);
-		khr_surface.destroy_surface(surface, None);
-		device.destroy_device(None);
-		// debug_utils.destroy_debug_utils_messenger(dbg_messenger, None);
-		instance.destroy_instance(None);
-	}
-
-	println!("Kthnx, bye!");
-
-	Ok(())
+	Ok(pipeline)
 }
 
 unsafe fn register_window_class(hinstance: HINSTANCE) -> ATOM {
@@ -808,6 +838,45 @@ unsafe fn register_window_class(hinstance: HINSTANCE) -> ATOM {
 	}
 
 	atom
+}
+
+unsafe fn create_window(hinstance: HINSTANCE, width: u32, height: u32) -> HWND {
+	let window_name = CStr::from_bytes_with_nul_unchecked(b"Prima!\0");
+	let hwnd = CreateWindowExA(
+			0,
+			WINDOW_CLASS_NAME.as_ptr(),
+			window_name.as_ptr(),
+			WS_OVERLAPPEDWINDOW,
+			// TODO: Center the window or load/save the last position.
+			CW_USEDEFAULT,
+			CW_USEDEFAULT,
+			// TODO: Deal with scaling/HI-DPI & window title.
+			width as i32,
+			height as i32,
+			ptr::null_mut(),
+			ptr::null_mut(),
+			hinstance,
+			ptr::null_mut(),
+	);
+
+	if hwnd.is_null() {
+		panic!("Failed to create a window.");
+	}
+
+	hwnd
+}
+
+fn get_window_client_size(hwnd: HWND) -> (u32, u32) {
+	let mut client_rect = RECT::default();
+	let err = unsafe { GetClientRect(hwnd, &mut client_rect) };
+	if err != 1 {
+		panic!("Failed to get window client rect.");
+	}
+
+	(
+		(client_rect.right - client_rect.left) as u32,
+		(client_rect.bottom - client_rect.top) as u32,
+	)
 }
 
 unsafe fn image_barrier(
@@ -845,7 +914,7 @@ unsafe extern "system" fn vulkan_debug_message_callback(
 	vk::FALSE
 }
 
-fn read_spv(path: &Path) -> Result<Vec<u32>, io::Error> {
+fn read_spv(path: &Path) -> Result<Vec<u32>> {
 	let mut f = fs::File::open(path)?;
 	let len = f.metadata()?.len() as usize;
 	assert!(len % 4 == 0);

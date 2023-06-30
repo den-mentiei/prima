@@ -58,26 +58,26 @@ void main() {
 	vec3 c;
 
 	[[branch]]
-		if (ptype == 0) {
-			float vx = uintBitsToFloat(prima_data[offset + 0]);
-			float vy = uintBitsToFloat(prima_data[offset + 1]);
-			// @Idea Use unused corner bits as a mask to encode
-			// color availability to compress single color tris
-			// more.
-			c = decode_color(prima_data[offset + 2]).rgb;
-			v = vec3(vx, vy, 0.0);
-		} else {
-			vec4 r = decode_vec(offset);
+	if (ptype == 0) {
+		float vx = uintBitsToFloat(prima_data[offset + 0]);
+		float vy = uintBitsToFloat(prima_data[offset + 1]);
+		// @Idea Use unused corner bits as a mask to encode
+		// color availability to compress single color tris
+		// more.
+		c = decode_color(prima_data[offset + 2]).rgb;
+		v = vec3(vx, vy, 0.0);
+	} else {
+		vec4 r = decode_vec(offset);
 
-			// @Speed Not sure if this optimizes well, can be rewritten
-			// via some bit-twiddling.
-			v = vec3(
-				r.x + ((corner == 2 || corner == 3) ? r.z : 0),
-				r.y + ((corner == 0 || corner == 3) ? r.w : 0),
-				0
-			);
-			c = vec3(1.0, 0.7, 0.4);
-		}
+		// @Speed Not sure if this optimizes well, can be rewritten
+		// via some bit-twiddling.
+		v = vec3(
+			r.x + ((corner == 2 || corner == 3) ? r.z : 0),
+			r.y + ((corner == 0 || corner == 3) ? r.w : 0),
+			0
+		);
+		c = vec3(1.0, 0.7, 0.4);
+	}
 
 	v.xy = floor(v.xy + 0.5f);
 	gl_Position = proj * vec4(v.xy, 0.0, 1.0);
